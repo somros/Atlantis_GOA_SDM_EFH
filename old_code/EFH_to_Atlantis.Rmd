@@ -1,0 +1,91 @@
+---
+title: "EFH rasters to Atlantis"
+author: "Alberto Rovellini"
+date: "4/14/2021"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+This document reads in the EFH rasters of relative abundance expressed as fourth root transformed CPUE and maps them to our Atlantis GOA geometry.
+```{r}
+# library(tidyverse)
+# library(raster)
+# library(sf)
+# library(rbgm)
+# library(viridis)
+# library(rnaturalearth)
+```
+
+```{r}
+#select <- dplyr::select
+```
+
+## Read in raster
+
+Read in one sample raster. Start from, say, adult sablefish. These come as rasters, which are a lot faster for R to handle and plot. However, converting them to sf objects makes them easier to manipulate. 
+
+```{r}
+efh_raster <- raster(paste0(this_path, instance, "/CPUEpredict.grd"))
+
+efh_sf <- efh_raster %>% rasterToPoints() %>% data.frame() %>% set_names(c("x", "y", "cpue")) %>% 
+  st_as_sf(coords = c(x = "x", y = "y"), crs = crs(efh_raster)@projargs)
+```
+
+Make some coastline data for plots later.
+```{r}
+efh_extent <- extent(efh_sf) # set the extent of the efh data
+
+# coast <- ne_countries(country = "United States of America", scale = "medium") # pull country ouitlines from Natural Earth
+
+coast <- coast %>% st_as_sf() %>% st_transform(crs = crs(efh_raster)@projargs) %>% st_crop(efh_extent) # clip it to the extent of the EFH rasters
+```
+## Map to Atlantis
+
+Read in Atlantis BGM.
+```{r}
+# atlantis_bgm <- read_bgm("GOA_WGS84_V3_final.bgm")
+# atlantis_sf <- atlantis_bgm %>% box_sf()
+```
+
+Transform the EFH spatial data frame to the projection of thew BGM file.
+```{r}
+efh_sf <- efh_sf %>% st_transform(crs = crs(atlantis_sf)@projargs)
+```
+
+Do a spatial join with the BGM and take average CPUE values per box.
+```{r}
+efh_by_box <- atlantis_sf %>% st_join(efh_sf)
+mean_by_box <- efh_by_box %>% group_by(.bx0) %>% summarise(mean_cpue = mean(cpue)) %>% mutate(boundary = atlantis_sf$boundary)
+
+# set NAs for boundary boxes for visualisation purposes
+mean_by_box <- mean_by_box %>% rowwise() %>% mutate(mean_cpue = ifelse(isTRUE(boundary), NA, mean_cpue))
+```
+
+View. The data first, the Atlantis map next.
+```{r, fig.width=12, fig.height=6}
+ggplot()+
+  geom_sf(data = efh_sf, aes(color = cpue), size = 0.5, alpha = 0.8)+
+  geom_sf(data = coast)+
+  scale_color_viridis(name = "Fourth root CPUE")+
+  theme_minimal()+
+  labs(title = paste0(instance, " - 2017 EFH models"))
+```
+
+```{r, fig.width=12, fig.height=6}
+ggplot()+
+  geom_sf(data = mean_by_box[mean_by_box$.bx0 < 92,], aes(fill = mean_cpue))+
+  scale_fill_viridis(name = "Fourth root CPUE", limits = c(min(efh_sf$cpue), max(efh_sf$cpue)))+
+  geom_sf(data = coast)+
+  theme_minimal()+
+  labs(title = paste0(instance, " - 2017 EFH models"))
+```
+
+TODO: 
+
+1. Fix islands so that they have no predictions (although probably hardly matters in Atlantis). Patterns seem consistent. Boxes in the WGOA will need rasters from the Aleutian Islands. Boxes in Norther BC will need information from different sources, or extrapolation from US portion of the model. 
+2. Need to go from $4^{th}$ root CPUE to number of individuals per box. CPUE should be per unit space (km$^2$? Check with Ned), so all we need to do is to back-transform it and then scale it up to the area of the box to have the number of individulas per box (which we need in the intial conditions). For the proportions, we need to calculate the total number of individuals in the entire model (add up all boxes), and then divide by the number of individuals per box to have the proportion. This is impeded by the fact that we do not have CPUE for the edges of the model (might have it for Aleutian Islands, but not for Norther BC).
+3. Check: do we have abundance data from Norther BC? Check DFO online resources.
+4: If we have no abundance data from BC or we have it but we cannot use it withy sdmTMB, then we will need to get more creative and derive abundance from biomass or similar. The end goal for S1-S4 is to get the total number of individuals from the entire model domain, if we miss boxes we cannot do that.

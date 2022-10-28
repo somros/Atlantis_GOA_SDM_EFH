@@ -1,0 +1,211 @@
+---
+title: "EFH GOA and AI merger"
+author: "Alberto Rovellini"
+date: "1/12/2022"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+This document stitches together GOA and AI EFH rasters for the species that were modelled in both areas, and calculates CPUE by Atlantis box. EFH rasters have 1 km resolution.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Read in rasters
+
+## GOA raster
+
+For visualisation, convert the raster to points and then to sf. rasterToPoints() seems to be faster to create and plot than rasterToPolygons(). 
+```{r, fig.width=12, fig.height=6, warning = FALSE}
+efh_goa <- raster(goa_raster)
+
+efh_goa_sf <- efh_goa %>% rasterToPoints() %>% data.frame() %>% set_names(c("x", "y", "index")) %>% 
+  st_as_sf(coords = c(x = "x", y = "y"), crs = crs(efh_goa)@projargs)
+
+# set coastline
+efh_extent <- extent(efh_goa_sf) # set the extent of the efh data
+coast <- coast_ak %>% st_as_sf() %>% st_transform(crs = crs(efh_goa)@projargs) %>% st_crop(efh_extent) # clip it to the extent of the EFH rasters
+
+ggplot()+
+  geom_sf(data = efh_goa_sf, aes(color = log1p(index)), size = 0.5, alpha = 0.8)+
+  geom_sf(data = coast)+
+  scale_color_viridis()+
+  theme_minimal()+
+  labs(title = paste("GOA EFH raster for", this_file, sep = " "))
+```
+
+## AI raster
+```{r, fig.width=12, fig.height=6, warning = FALSE}
+efh_ai <- raster(ai_raster)
+
+efh_ai_sf <- efh_ai %>% rasterToPoints() %>% data.frame() %>% set_names(c("x", "y", "index")) %>% 
+  st_as_sf(coords = c(x = "x", y = "y"), crs = crs(efh_ai)@projargs)
+
+# set coastline
+efh_extent <- extent(efh_ai_sf) # set the extent of the efh data
+coast <- coast_ak %>% st_as_sf() %>% st_transform(crs = crs(efh_ai)@projargs) %>% st_crop(efh_extent) # clip it to the extent of the EFH rasters
+
+ggplot()+
+  geom_sf(data = efh_ai_sf, aes(color = log1p(index)), size = 0.5, alpha = 0.8)+
+  geom_sf(data = coast)+
+  scale_color_viridis()+
+  theme_minimal()+
+  labs(title = paste("AI EFH raster for", this_file, sep = " "))
+```
+
+# Merge GOA and AI
+
+View this first, again use points and then sf. Reproject the resulting raster to the Atlantis CRS.
+```{r, fig.width=12, fig.height=6, warning = FALSE}
+origin(efh_ai) <- origin(efh_goa)
+efh <- raster::merge(efh_goa, efh_ai)
+
+# reproject to Atlantis
+efh <- efh %>% raster::projectRaster(crs = crs(atlantis_sf)@projargs)
+
+efh_sf <- efh %>% rasterToPoints() %>% data.frame() %>% set_names(c("x", "y", "index")) %>% 
+  st_as_sf(coords = c(x = "x", y = "y"), crs = crs(efh)@projargs)
+
+# set coastline
+efh_extent <- extent(efh_sf) # set the extent of the efh data
+coast <- coast_ak %>% st_as_sf() %>% st_transform(crs = crs(efh)@projargs) %>% st_crop(efh_extent) # clip it to the extent of the EFH rasters
+
+ggplot()+
+  geom_sf(data = efh_sf, aes(color = log1p(index)), size = 0.5, alpha = 0.8)+
+  geom_sf(data = coast)+
+  scale_color_viridis()+
+  theme_minimal()+
+  labs(title = paste("AI and GOA EFH raster for", this_file, sep = " "))
+```
+
+# Map to Atlantis
+
+## Area overlap
+
+### Total area
+
+Transform the EFH spatial data frame to the projection of the BGM file. Still use rasterToPoints, because we know the size of the cell (1 km$^2$) and therefore we do not need area operations, and rasterToPoints() is faster to handle than rasterToPolygon().
+
+Assess how much of each Atlantis box is covered by EFH data. 
+```{r}
+intersection <- mask(efh, (atlantis_sf %>% filter(!boundary & .bx0 < 92 & botz < 0))) %>% rasterToPoints() %>% data.frame() %>% set_names(c("x", "y", "index")) %>% 
+  st_as_sf(coords = c(x = "x", y = "y"), crs = crs(atlantis_sf)@projargs) # clip the large AI+GOA rasters to our Atlantis domain, excluding BC, boundary boxes, and island boxes (which should become boundary at some point anyway)
+
+# get raster area in m2 (area() counts the number of cells and multiplying by 1e+6 to get m2
+efh_area <- nrow(intersection)*1e+6
+
+#atlantis area. Discard Canada (boxid > 92) and boundary boxes (including islands), because EFH is only AK and down to 1000m
+atlantis_area <- atlantis_sf %>% filter(!boundary & .bx0 < 92 & botz < 0) %>% select(area) %>% st_set_geometry(NULL) %>% sum()
+
+area_ratio <- round(efh_area/atlantis_area*100, 2)
+
+paste("The EFH raster for", this_file, "covers", area_ratio, "% of the Atlantis GOA area (not counting British Columbia and boundary boxes).", sep = " ")
+```
+
+Visualise.
+```{r, fig.width=12, fig.height=6, warning = FALSE}
+ggplot()+
+  geom_sf(data = intersection, aes(color = log1p(index)), size = 0.1)+
+  scale_color_viridis()+
+  geom_sf(data = atlantis_sf[(atlantis_sf$.bx0 < 92) & !atlantis_sf$boundary,], fill = NA, color = "red")+
+  theme_minimal()+
+  labs(title = paste("AI and GOA EFH raster for", this_file, sep = " "))
+```
+
+### Individual boxes
+
+Do the same box-by-box. Row-wise geometry operations are very slow. We know that one cell is 1 km$^2$, so we can have a very approximate idea of the area of the overlap by adding up the number of cells within each box. Note that cells along the faces appear in both boxes - if the area of the cells inside a box is larger than the area of th box, the box is fully covered.
+```{r}
+efh_atlantis <- st_join(atlantis_sf, intersection)
+
+efh_atlantis <- efh_atlantis %>% group_by(.bx0) %>% tally() %>% mutate(efh_area = n*1e+6)
+
+efh_atlantis <- efh_atlantis %>% left_join(atlantis_sf %>% st_set_geometry(NULL), by = ".bx0")
+
+efh_atlantis <- efh_atlantis %>% rowwise() %>% mutate(prop = ifelse(efh_area/area>1,1,efh_area/area), use = ifelse(prop>0.9,TRUE,FALSE)) 
+
+paste("Boxes that have more than", 0.9, "EFH coverage for", this_file,  "are", length(which(efh_atlantis$use)), "out of", nrow(atlantis_sf %>% filter(!boundary & .bx0 < 92 & botz < 0)), ", which is", round(length(which(efh_atlantis$use))/nrow(atlantis_sf %>% filter(!boundary & .bx0 < 92 & botz < 0))*100,2), "%", sep = " ")
+```
+
+```{r, fig.width=12, fig.height=6, warning = FALSE}
+ggplot()+
+  geom_sf(data = efh_atlantis, aes(fill = prop))+
+  scale_fill_viridis()+
+  theme_minimal()+
+  labs(title = paste("Proportion of the box area overlapping with \n EFH raster for", this_file))
+```
+What do we do with boxes that do not have EFH information? We can use sdmTMB to fill the gaps, or for the whole thing if only a few boxes have EFH information.
+
+## Index per box
+
+Do a spatial join with the BGM and take average index values per box.
+```{r, message = FALSE}
+efh_sf <- efh_sf %>% st_transform(crs = crs(atlantis_sf)@projargs)
+
+efh_by_box <- atlantis_sf %>% st_join(efh_sf)
+mean_by_box <- efh_by_box %>% group_by(area, .bx0) %>% summarise(mean_index = mean(index)) %>% ungroup() %>% arrange(.bx0) %>% mutate(boundary = atlantis_sf$boundary)
+
+# set NAs for boundary boxes for visualisation purposes
+mean_by_box <- mean_by_box %>% rowwise() %>% mutate(mean_index = ifelse(isTRUE(boundary), NA, mean_index))
+```
+
+View. The data first, the Atlantis map next.
+```{r, fig.width=12, fig.height=6, warning = FALSE}
+ggplot()+
+  geom_sf(data = efh_sf, aes(color = index), size = 0.5, alpha = 0.8)+
+  geom_sf(data = coast)+
+  scale_color_viridis()+
+  theme_minimal()+
+  labs(title = paste0(this_file, " - 2022 EFH models"))
+```
+
+```{r, fig.width=12, fig.height=6, warning = FALSE}
+coast <- coast_ak %>% st_as_sf() %>% st_transform(crs = crs(efh)@projargs) %>% st_crop(extent(atlantis_sf)) # clip it to the extent of the EFH rasters
+
+ggplot()+
+  geom_sf(data = mean_by_box[mean_by_box$.bx0 < 92,], aes(fill = mean_index))+
+  scale_fill_viridis(name = "Abundance index", limits = c(min(mean_by_box$mean_index), max(mean_by_box$mean_index)))+
+  geom_sf(data = coast)+
+  theme_minimal()+
+  labs(title = paste0(this_file, " - 2022 EFH models"))
+```
+
+## Subset to boxes that have sufficient coverage
+
+```{r, fig.width=12, fig.height=6, warning = FALSE}
+mean_by_box <- mean_by_box %>% left_join(efh_atlantis %>% st_set_geometry(NULL) %>% select(.bx0, use), by = ".bx0")
+
+mean_by_box <- mean_by_box[which(mean_by_box$use),]
+
+ggplot()+
+  geom_sf(data = mean_by_box, aes(fill = mean_index))+
+  scale_fill_viridis(name = "Abundance index", limits = c(min(mean_by_box$mean_index), max(mean_by_box$mean_index)))+
+  geom_sf(data = coast)+
+  theme_minimal()+
+  labs(title = paste0(this_file, "for boxes with >0.9 EFH coverage"))
+```
+
+# Numbers per box
+
+CPUE in EFH is fourth-root numbers per hectare, so first convert to fourth power, then convert to CPUE km$^{-2}$, then multiply by area of the box. Area of the boxes in BGM is in m$^2$, so we need to divide by 1e-6.
+```{r, fig.width=12, fig.height=6, warning = FALSE}
+# mean_by_box <- mean_by_box %>% mutate(num_km2 = ((mean_cpue)^4)*100, # from ha to km2
+#                                       numbers = num_km2*area*1e-06) # total per box (box area is in m2 so divide by 1e-6 because CPUE is in km2)
+# 
+# ggplot()+
+#   geom_sf(data = mean_by_box[mean_by_box$.bx0 < 92,], aes(fill = num_km2))+
+#   scale_fill_viridis(limits = c(0, max(mean_by_box$num_km2, na.rm = TRUE)), 
+#                      name = expression(paste("CPUE num. km"^-2)))+
+#   geom_sf(data = coast)+
+#   theme_minimal()+
+#   labs(title = paste0(this_file, " - 2017 EFH models"))
+```
+
+Only considering those boxes where EFH covers >90% of the box area.
+```{r}
+# mean_by_box %>% st_set_geometry(NULL) %>% select(.bx0, boundary, num_km2, numbers) %>% kable(align = 'lccc', format = "markdown", col.names = c("Box", "Boundary", "CPUE (num km-2)", "Numbers/box"))
+```
